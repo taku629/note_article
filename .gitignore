@@ -1,0 +1,24 @@
+# 環境変数・シークレット（絶対にコミットしない）
+.env
+
+# 実行時データ（個人情報・状態管理）
+drafts.json
+posted.txt
+current_theme.txt
+
+# ログ
+*.log
+
+# デバッグ用スクリーンショット
+screenshot_*.png
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE
+.DS_Store
+Thumbs.db
