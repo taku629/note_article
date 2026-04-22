@@ -127,7 +127,37 @@ automation.py
 
 ---
 
-## 5. ログファイル運用
+## 5. 「8:00 に note の下書きが作られる」は誤解
+
+`auto-trend` は note.com API を**一切呼ばない**。
+
+| 時刻 | note.com への操作 | ローカルへの操作 |
+|---|---|---|
+| 8:00 `auto-trend` | なし | .md 保存 / `drafts.json` 追記（`note_id: null`） |
+| 21:00 `publish-latest` | create + 即時公開（2 API calls） | `drafts.json` 更新（`published: true`） |
+
+ブラウザのダッシュボードに記事が現れるのは 21:00 以降（公開済み状態として）。
+
+---
+
+## 6. ブラウザ下書きと自動フローの関係
+
+| 作成経路 | `drafts.json` | 自動公開 |
+|---|---|---|
+| `auto-trend` / `create-draft` 経由 | 登録される | 21:00 に自動公開 |
+| ブラウザで直接作成 | 登録されない | 自動公開されない（手動公開） |
+
+ブラウザ下書きを自動フローに乗せる唯一の確実な方法：
+1. 本文を `.md` ファイルにコピーして保存
+2. `python3 automation.py --mode create-draft --file xxx.md`
+3. 21:00 の `publish-latest` が**新規ノートとして**作成・公開する
+   （既存の下書きを更新するのではなく、新規作成になる点に注意）
+
+「既存の note_id に対して publish するだけ」を試みた場合、note.com API は別セッションからの `draft_save(is_temp_saved=false)` を 201 で返すが実際には公開されないことが確認されている（→ 新規作成フローに統一した経緯）。
+
+---
+
+## 8. ログファイル運用
 
 | ファイル | 書き込みモード | ローテーション |
 |---|---|---|
@@ -143,7 +173,7 @@ mv auto.log auto_$(date +%Y%m).log
 
 ---
 
-## 6. WSL 環境での cron 注意点
+## 9. WSL 環境での cron 注意点
 
 WSL は PC 再起動時に cron デーモンが自動起動しない。
 以下を `~/.bashrc` または `/etc/wsl.conf` に設定しておくと手動起動が不要になる。
@@ -161,3 +191,115 @@ command = service cron start
 ```
 
 （`/etc/wsl.conf` の `[boot]` セクションは WSL2 のみ有効）
+
+---
+
+## 10. デフォルトトピック多様化の設計
+
+### 背景・問題
+
+Google Trends JP スコアが 0（大学生テーマと無関係なトレンドのみ）の日が続くと、
+`_DEFAULT_TOPICS`（5件）だけから Claude が毎日選び続け、同系統テーマが連続する。
+例：2026-04-17〜19 の3日間、「大学生が投資を始めて6ヶ月で学んだこと」が毎日選ばれた。
+
+### 現状のフォールバックロジック（`trend_selector.py`）
+
+```
+1. Google Trends RSS から最大30件取得
+2. PRIORITY_KEYWORDS（23語）との一致数でスコアを計算
+3. score >= 1 のトレンドだけを候補にする
+4. score >= 1 が1件もない場合 → _DEFAULT_TOPICS[:5] の5件を候補として使用
+5. 候補リストを Claude haiku に渡してタイトル1件を選ばせる
+6. API 失敗時 → candidates[0]（リスト先頭）を返す
+```
+
+問題点：
+- `_DEFAULT_TOPICS` が5件しかなく多様性が低い
+- Claude が同じ候補から繰り返し選ぶと同系統テーマが連続する
+- 「最近使ったテーマを避ける」仕組みがない
+
+---
+
+### 拡張デフォルトトピック案（6カテゴリ × 3件 = 18件）
+
+```python
+_DEFAULT_TOPICS_BY_CATEGORY = {
+    "money": [
+        "大学生の節約術5選【実際にやった】",
+        "奨学金を借りながら月3万貯金した方法",
+        "【実体験】大学生が投資を始めて6ヶ月で学んだこと",
+    ],
+    "side_job": [
+        "大学生がバイトと副業を両立してみた話",
+        "大学生がクラウドソーシングで月2万稼いだ実録",
+        "バイト代を増やすために大学3年でやったこと3選",
+    ],
+    "sns": [
+        "【実体験】SNSフォロワー1000人になるまでにやったこと",
+        "大学生がnoteを3ヶ月続けた結果【正直レポート】",
+        "TikTok運用を半年やって気づいた大学生が伸びるコツ",
+    ],
+    "career": [
+        "就活と副業を両立した大学生の1日ルーティン",
+        "大学2年でインターンを始めて変わったこと",
+        "就活で後悔しないために大学1年からやっておくべきこと",
+    ],
+    "study": [
+        "大学生が独学でプログラミングを学んだ3ヶ月の記録",
+        "一人暮らし大学生が食費月1.5万に抑えた自炊術",
+        "大学の授業を最大限活かして奨学金を増やした話",
+    ],
+    "mindset": [
+        "大学生のうちにやっておけばよかった自己投資5選",
+        "サークルとバイトと就活を両立できた理由",
+        "大学4年間で1番役に立ったお金の使い方",
+    ],
+}
+```
+
+---
+
+### 重複回避ロジック設計案
+
+**アプローチ：「直近 N 日のカテゴリを除外して候補を絞る」**
+
+1. `drafts.json` から直近 N 日（推奨: 7日）の `title` を取得
+2. 各タイトルに含まれるキーワードから「最近使ったカテゴリ」を特定
+3. `_DEFAULT_TOPICS_BY_CATEGORY` から最近のカテゴリを除外した候補を LLM に渡す
+4. すべてのカテゴリが使用済みの場合（7日以上連続でデフォルト利用）は全カテゴリにリセット
+
+**カテゴリ判定キーワード**
+
+```python
+_CATEGORY_HINTS = {
+    "money":    ["節約", "貯金", "投資", "奨学金", "お金"],
+    "side_job": ["バイト", "副業", "稼ぐ", "クラウド", "フリーランス"],
+    "sns":      ["SNS", "フォロワー", "note", "TikTok", "YouTube", "Instagram"],
+    "career":   ["就活", "インターン", "キャリア", "転職"],
+    "study":    ["プログラミング", "勉強", "食費", "一人暮らし", "授業"],
+    "mindset":  ["自己投資", "サークル", "やっておけばよかった"],
+}
+```
+
+**処理フロー（疑似コード）**
+
+```
+recent_titles    = drafts.json から直近7日の title を取得
+recent_categories = recent_titles を _CATEGORY_HINTS で判定した category の set
+
+available = 全カテゴリ - recent_categories
+if not available:
+    available = 全カテゴリ  # 7日でリセット
+
+candidates = available の各カテゴリからランダムに2件ずつ選ぶ（最大12件）
+topic = _llm_select_topic(candidates, use_trends=False)
+```
+
+**実装時の変更ファイル：`trend_selector.py`のみ**
+
+- `_DEFAULT_TOPICS`（5件フラットリスト）を `_DEFAULT_TOPICS_BY_CATEGORY`（辞書）に置き換え
+- `_CATEGORY_HINTS` を追加
+- `select_today_theme()` に `_get_fallback_candidates(drafts_path)` の呼び出しを追加
+- `_get_fallback_candidates()` を新規追加（上記疑似コードの実装）
+
+外部インターフェース（戻り値の dict 構造）は変更しないため、`automation.py` の修正は不要。
