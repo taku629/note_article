@@ -3,6 +3,7 @@ import os
 import sys
 import logging
 import time
+import requests as _requests
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
@@ -13,6 +14,9 @@ from post import post_article, parse_markdown_file, get_session, create_note, dr
 from config import NOTE_URLNAME
 
 load_dotenv(Path(__file__).parent / ".env")
+
+import smtplib
+from email.mime.text import MIMEText
 
 # 下書き管理ファイル
 DRAFTS_FILE = Path(__file__).parent / "drafts.json"
@@ -27,6 +31,77 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# ──────────────────────────────────────────
+# 公開確認ヘルパー
+# ──────────────────────────────────────────
+
+def _send_error_notification(subject: str, body: str) -> None:
+    gmail_user = os.environ.get("GMAIL_USER")
+    gmail_pass = os.environ.get("GMAIL_APP_PASSWORD")
+    notify_to  = os.environ.get("NOTIFY_TO")
+    if not all([gmail_user, gmail_pass, notify_to]):
+        logger.warning("Gmail通知設定が不完全なためスキップします")
+        return
+    try:
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["Subject"] = subject
+        msg["From"]    = gmail_user
+        msg["To"]      = notify_to
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+            smtp.login(gmail_user, gmail_pass)
+            smtp.send_message(msg)
+        logger.info(f"通知メール送信完了: {notify_to}")
+    except Exception as e:
+        logger.warning(f"通知メール送信失敗: {e}")
+
+
+def _verify_published(key: str) -> bool:
+    """
+    公開URLへ GET して記事が実際に見えるか確認する。
+    200 → True（公開成功）
+    それ以外 → False（クッキー失効などで未公開の可能性）
+    """
+    url = f"https://note.com/{NOTE_URLNAME}/n/{key}"
+    try:
+        time.sleep(2)  # note 側の反映待ち
+        resp = _requests.get(url, timeout=15)
+        return resp.status_code == 200
+    except Exception as e:
+        logger.warning(f"公開確認リクエスト失敗: {e}")
+        return False
+
+
+# ──────────────────────────────────────────
+# 記事品質チェック（タグなし版 / auto-trend 用）
+# ──────────────────────────────────────────
+
+_QC_KEYWORDS = [
+    # 読者属性
+    "大学生",
+    # お金・副業系
+    "副業", "バイト", "奨学金", "資産形成", "節約", "フリーランス", "スキルアップ", "お金",
+    "投資", "稼ぐ", "貯金", "収入",
+    # SNS・発信系
+    "SNS", "フォロワー", "YouTube", "TikTok", "Instagram", "発信",
+    # キャリア系
+    "就活", "インターン", "転職", "キャリア",
+]
+_MAX_ARTICLE_RETRIES = 3
+
+
+def _article_quality_check(title: str, body_md: str) -> list[str]:
+    """
+    生成直後の記事品質チェック（タグは publish 時に生成するためここでは不要）。
+    戻り値: エラーリスト（空なら合格）
+    """
+    errors = []
+    if len(body_md) < 3000:
+        errors.append(f"文字数不足 ({len(body_md)}字)。3000字以上必要。")
+    if not any(kw in title for kw in _QC_KEYWORDS):
+        errors.append(f"タイトルに主要キーワードがありません: {title}")
+    return errors
+
 
 # ──────────────────────────────────────────
 # drafts.json ヘルパー
@@ -45,56 +120,35 @@ def _save_drafts(drafts: list[dict]) -> None:
 
 
 # ──────────────────────────────────────────
-# モード: create-draft（下書き投稿 + drafts.json 記録）
+# モード: create-draft（ファイル保存のみ・note には投稿しない）
 # ──────────────────────────────────────────
 
 def mode_create_draft(filepath: str) -> None:
     """
-    記事を下書きとして note に投稿し、note_id / key / 日時 を drafts.json に記録する。
+    記事ファイルを drafts.json に登録するだけ（note への投稿は行わない）。
+    note.com API は「作成 → 即時公開」しか確実に動作しないため、
+    publish-latest 時に新規作成 + 即時公開をまとめて行う。
     使い方: python3 automation.py --mode create-draft --file articles/article_4.md
     """
     logger.info(f"=== create-draft モード: {filepath} ===")
 
     abs_path = str(Path(filepath).resolve())
-    title, body_html, body_md = parse_markdown_file(abs_path)
-
-    # タグ生成（失敗してもスキップ）
-    tags = []
-    try:
-        from config import ANTHROPIC_API_KEY
-        if ANTHROPIC_API_KEY:
-            tags = generate_tags(title, body_md)
-            logger.info(f"タグ: {tags}")
-    except Exception as e:
-        logger.warning(f"タグ生成スキップ: {e}")
-
+    title, _, body_md = parse_markdown_file(abs_path)
     logger.info(f"タイトル: {title}  ({len(body_md)}字)")
 
-    # note 作成
-    session = get_session()
-    logger.info("note 作成中...")
-    note_id, key = create_note(session, title, body_html)
-    logger.info(f"作成完了: note_id={note_id}, key={key}")
-
-    # 下書き保存（is_temp_saved=true）
-    logger.info("下書き保存中...")
-    draft_save(session, note_id, title, body_html, body_md, publish=False, hashtags=tags)
-
-    # drafts.json に記録
     entry = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
-        "note_id": note_id,
-        "key": key,
-        "title": title,
-        "file": abs_path,
-        "published": False,
+        "note_id":    None,
+        "key":        None,
+        "title":      title,
+        "file":       abs_path,
+        "published":  False,
     }
     drafts = _load_drafts()
     drafts.append(entry)
     _save_drafts(drafts)
 
-    logger.info(f"✓ 下書き保存完了: https://note.com/notes/{note_id}/edit")
-    logger.info(f"  drafts.json に記録しました (note_id={note_id})")
+    logger.info(f"✓ drafts.json に登録しました（投稿は publish-latest 実行時）")
 
 
 # ──────────────────────────────────────────
@@ -119,40 +173,63 @@ def mode_publish_latest() -> None:
         logger.error("未公開の下書きがありません。全件公開済みです。")
         sys.exit(1)
 
-    entry = unpublished[-1]
-    note_id = entry["note_id"]
-    key     = entry["key"]
-    title   = entry["title"]
+    entry    = unpublished[-1]
+    title    = entry["title"]
     filepath = entry["file"]
 
     logger.info(f"対象: {title}")
-    logger.info(f"note_id: {note_id} / key: {key}")
     logger.info(f"ファイル: {filepath}")
 
-    # 本文を再読込してタグ生成
+    # 本文読み込み・タグ生成
     _, body_html, body_md = parse_markdown_file(filepath)
     tags = []
     try:
         from config import ANTHROPIC_API_KEY
         if ANTHROPIC_API_KEY:
             tags = generate_tags(title, body_md)
+            logger.info(f"タグ: {tags}")
     except Exception as e:
         logger.warning(f"タグ生成スキップ: {e}")
 
-    # 公開（is_temp_saved=false）
+    # 新規作成 → 即時公開（create + draft_save を1セッションで連続実行）
     session = get_session()
-    logger.info("公開中 (is_temp_saved=false)...")
+    logger.info("note 新規作成中...")
+    note_id, key = create_note(session, title, body_html)
+    logger.info(f"作成完了: note_id={note_id}, key={key}")
+
+    logger.info("即時公開中 (is_temp_saved=false)...")
     draft_save(session, note_id, title, body_html, body_md, publish=True, hashtags=tags)
 
-    # drafts.json の published フラグを更新
+    # 公開確認: 実際にURLにアクセスして記事が見えるか検証
+    url = f"https://note.com/{NOTE_URLNAME}/n/{key}"
+    logger.info(f"公開確認中: {url}")
+    if not _verify_published(key):
+        logger.error("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        logger.error("公開確認失敗: 記事が見つかりません。")
+        logger.error("NOTE_SESSION_COOKIE が失効している可能性があります。")
+        logger.error(".env の NOTE_SESSION_COOKIE を更新して再実行してください。")
+        logger.error("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        _send_error_notification(
+            subject="【note自動投稿】公開失敗: NOTE_SESSION_COOKIE を更新してください",
+            body=(
+                f"記事「{title}」の公開確認に失敗しました。\n\n"
+                f"原因: NOTE_SESSION_COOKIE が失効している可能性があります。\n\n"
+                f".env の NOTE_SESSION_COOKIE を更新して、以下のコマンドで再実行してください:\n"
+                f"  python3 automation.py --mode publish-latest\n"
+            ),
+        )
+        sys.exit(1)
+
+    # drafts.json 更新（確認OKの場合のみ）
     for d in drafts:
-        if d["note_id"] == note_id:
-            d["published"] = True
+        if d["file"] == filepath and not d.get("published"):
+            d["note_id"]     = note_id
+            d["key"]         = key
+            d["published"]   = True
             d["published_at"] = datetime.now().isoformat(timespec="seconds")
             break
     _save_drafts(drafts)
 
-    url = f"https://note.com/{NOTE_URLNAME}/n/{key}"
     logger.info(f"✓ 公開完了: {url}")
 
 
@@ -246,10 +323,21 @@ def mode_auto_trend() -> None:
     logger.info(f"   trend_raw    : {topic_info['picked_raw']} (score={topic_info['score']})")
     logger.info(f"   keyword      : {topic_info['keyword']}")
 
-    # ② 記事生成（大学生 taku キャラ）
-    logger.info("② 記事生成中 (Claude / taku キャラ)...")
-    title, body_md = article_generator.generate_article_taku(topic_info)
-    logger.info(f"   タイトル: {title}  ({len(body_md)}字)")
+    # ② 記事生成（大学生 taku キャラ）—— 品質チェック付きリトライ
+    title, body_md = None, None
+    for attempt in range(1, _MAX_ARTICLE_RETRIES + 1):
+        logger.info(f"② 記事生成中 (attempt {attempt}/{_MAX_ARTICLE_RETRIES}, Claude / taku キャラ)...")
+        _t, _b = article_generator.generate_article_taku(topic_info)
+        qc_errors = _article_quality_check(_t, _b)
+        if not qc_errors:
+            title, body_md = _t, _b
+            logger.info(f"   タイトル: {title}  ({len(body_md)}字)")
+            break
+        logger.warning(f"   品質チェック失敗 (attempt {attempt}): {qc_errors}")
+
+    if title is None:
+        logger.error("最大リトライ回数を超えました。記事生成を中止します。")
+        sys.exit(1)
 
     # ③ .md ファイルに保存（同日ファイルがあれば連番で回避）
     today      = datetime.now().strftime("%Y%m%d")
@@ -264,28 +352,11 @@ def mode_auto_trend() -> None:
     filepath.write_text(f"# {title}\n\n{body_md}", encoding="utf-8")
     logger.info(f"③ ファイル保存: {filepath}")
 
-    # ④ note 下書き投稿
-    logger.info("④ note 下書き投稿中 (is_temp_saved=true)...")
-    _, body_html, body_md_parsed = parse_markdown_file(str(filepath))
-
-    tags = []
-    try:
-        from config import ANTHROPIC_API_KEY
-        if ANTHROPIC_API_KEY:
-            tags = generate_tags(title, body_md_parsed)
-            logger.info(f"   タグ: {tags}")
-    except Exception as e:
-        logger.warning(f"   タグ生成スキップ: {e}")
-
-    session = get_session()
-    note_id, key = create_note(session, title, body_html)
-    draft_save(session, note_id, title, body_html, body_md_parsed, publish=False, hashtags=tags)
-
-    # ⑤ drafts.json に記録
+    # ④ drafts.json に登録（note への投稿は publish-latest 実行時にまとめて行う）
     entry = {
         "created_at":   datetime.now().isoformat(timespec="seconds"),
-        "note_id":      note_id,
-        "key":          key,
+        "note_id":      None,
+        "key":          None,
         "title":        title,
         "file":         str(filepath.resolve()),
         "published":    False,
@@ -296,11 +367,128 @@ def mode_auto_trend() -> None:
     drafts.append(entry)
     _save_drafts(drafts)
 
-    logger.info(f"   note_id : {note_id}")
-    logger.info(f"   key     : {key}")
-    logger.info(f"✓ 下書き保存完了: https://note.com/notes/{note_id}/edit")
-    logger.info(f"  Markdown : {filepath}")
-    logger.info(f"  drafts.json に記録しました")
+    logger.info(f"✓ 記事生成・登録完了")
+    logger.info(f"  Markdown    : {filepath}")
+    logger.info(f"  drafts.json : 登録済み（21:00 の publish-latest で自動公開）")
+
+
+# ──────────────────────────────────────────
+# モード: auto-trend-publish-now（生成→下書き→公開を1回で完結）
+# ──────────────────────────────────────────
+
+def mode_auto_trend_publish_now() -> None:
+    """
+    トレンド取得 → 記事生成（品質チェック付きリトライ）→ .md 保存
+    → note 新規作成 → 即時公開 → drafts.json に published:true で記録
+    まで一気通貫で実行する。
+
+    通常運用は 8:00 auto-trend + 21:00 publish-latest の2段階だが、
+    その場で即時公開したい場合（手動実行・別 cron 等）にこのモードを使う。
+
+    cron 例（8:00 に生成＆即時公開）:
+      0 8 * * * python3 automation.py --mode auto-trend-publish-now >> auto.log 2>&1
+    """
+    logger.info("=== auto-trend-publish-now: 生成→公開 一気通貫フロー開始 ===")
+
+    # ① トレンド取得 & テーマ選定
+    logger.info("① Google Trends 取得中...")
+    topic_info = trend_selector.select_today_theme()
+    logger.info(f"   picked_topic : {topic_info['topic']}")
+    logger.info(f"   trend_raw    : {topic_info['picked_raw']} (score={topic_info['score']})")
+    logger.info(f"   keyword      : {topic_info['keyword']}")
+
+    # ② 記事生成（品質チェック付きリトライ）
+    title, body_md = None, None
+    for attempt in range(1, _MAX_ARTICLE_RETRIES + 1):
+        logger.info(f"② 記事生成中 (attempt {attempt}/{_MAX_ARTICLE_RETRIES}, Claude / taku キャラ)...")
+        _t, _b = article_generator.generate_article_taku(topic_info)
+        qc_errors = _article_quality_check(_t, _b)
+        if not qc_errors:
+            title, body_md = _t, _b
+            logger.info(f"   タイトル: {title}  ({len(body_md)}字)")
+            break
+        logger.warning(f"   品質チェック失敗 (attempt {attempt}): {qc_errors}")
+
+    if title is None:
+        logger.error("最大リトライ回数を超えました。記事生成を中止します。")
+        sys.exit(1)
+
+    # ③ .md ファイルに保存
+    today      = datetime.now().strftime("%Y%m%d")
+    output_dir = Path("/home/tk250127/note-articles/output")
+    filepath   = output_dir / f"article_{today}.md"
+    if filepath.exists():
+        n = 2
+        while (output_dir / f"article_{today}_{n}.md").exists():
+            n += 1
+        filepath = output_dir / f"article_{today}_{n}.md"
+
+    filepath.write_text(f"# {title}\n\n{body_md}", encoding="utf-8")
+    logger.info(f"③ ファイル保存: {filepath}")
+
+    # ④ タグ生成
+    tags = []
+    try:
+        from config import ANTHROPIC_API_KEY
+        if ANTHROPIC_API_KEY:
+            tags = generate_tags(title, body_md)
+            logger.info(f"④ タグ: {tags}")
+    except Exception as e:
+        logger.warning(f"タグ生成スキップ: {e}")
+
+    # ⑤ note 新規作成 → 即時公開
+    _, body_html, _ = parse_markdown_file(str(filepath))
+    session = get_session()
+    logger.info("⑤ note 新規作成中...")
+    note_id, key = create_note(session, title, body_html)
+    logger.info(f"   作成完了: note_id={note_id}, key={key}")
+
+    logger.info("   即時公開中 (is_temp_saved=false)...")
+    draft_save(session, note_id, title, body_html, body_md, publish=True, hashtags=tags)
+
+    # 公開確認: 実際にURLにアクセスして記事が見えるか検証
+    url = f"https://note.com/{NOTE_URLNAME}/n/{key}"
+    logger.info(f"⑥ 公開確認中: {url}")
+    if not _verify_published(key):
+        logger.error("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        logger.error("公開確認失敗: 記事が見つかりません。")
+        logger.error("NOTE_SESSION_COOKIE が失効している可能性があります。")
+        logger.error(".env の NOTE_SESSION_COOKIE を更新して再実行してください。")
+        logger.error("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        _send_error_notification(
+            subject="【note自動投稿】公開失敗: NOTE_SESSION_COOKIE を更新してください",
+            body=(
+                f"記事「{title}」の公開確認に失敗しました。\n\n"
+                f"原因: NOTE_SESSION_COOKIE が失効している可能性があります。\n\n"
+                f".env の NOTE_SESSION_COOKIE を更新して、以下のコマンドで再実行してください:\n"
+                f"  python3 automation.py --mode publish-latest\n"
+            ),
+        )
+        sys.exit(1)
+
+    # ⑦ drafts.json に published:true で記録（確認OKの場合のみ）
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    entry = {
+        "created_at":    now_iso,
+        "note_id":       note_id,
+        "key":           key,
+        "title":         title,
+        "file":          str(filepath.resolve()),
+        "published":     True,
+        "published_at":  now_iso,
+        "picked_topic":  topic_info["topic"],
+        "trend_raw":     topic_info["picked_raw"],
+    }
+    drafts = _load_drafts()
+    drafts.append(entry)
+    _save_drafts(drafts)
+
+    logger.info(f"✓ 公開完了")
+    logger.info(f"  Markdown    : {filepath}")
+    logger.info(f"  note_id     : {note_id}")
+    logger.info(f"  key         : {key}")
+    logger.info(f"  公開URL     : {url}")
+    logger.info(f"  drafts.json : published:true で記録済み")
 
 
 if __name__ == "__main__":
@@ -309,9 +497,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mode",
         choices=[
-            "auto-trend",      # 完全自動: トレンド取得→記事生成→下書き保存
-            "publish-latest",  # 最新下書きを公開
-            "create-draft",    # 指定ファイルを下書き保存
+            "auto-trend",              # 完全自動2段階①: トレンド取得→記事生成→下書き保存
+            "auto-trend-publish-now",  # 即時公開: 生成→下書き→公開を1回で完結
+            "publish-latest",          # 完全自動2段階②: 最新下書きを公開
+            "create-draft",            # 指定ファイルを下書き保存
             "trend", "stock", "scheduler",
             "dry-post-once", "test-post-once",
         ],
@@ -325,6 +514,9 @@ if __name__ == "__main__":
     
     if args.mode == "auto-trend":
         mode_auto_trend()
+
+    elif args.mode == "auto-trend-publish-now":
+        mode_auto_trend_publish_now()
 
     elif args.mode == "dry-post-once":
         if not args.file:
