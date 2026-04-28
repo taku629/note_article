@@ -41,7 +41,7 @@ ACCOUNTS: dict[str, dict] = {
         "drafts_file":    "drafts_b.json",
         "posted_file":    "posted_b.txt",
         "articles_dir":   "/home/tk250127/note-articles/output/b",
-        "quality_keywords": ["AI", "自動化", "LLM", "効率化", "仕組み化", "副業", "ツール"],
+        "quality_keywords": ["AI", "自動化", "LLM", "効率化", "仕組み化", "副業", "ツール", "ChatGPT", "Claude", "Python"],
     },
 }
 

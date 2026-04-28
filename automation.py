@@ -375,9 +375,10 @@ def mode_auto_trend(account: str = "a") -> None:
     logger.info(f"   trend_raw    : {topic_info['picked_raw']} (score={topic_info['score']})")
     logger.info(f"   keyword      : {topic_info['keyword']}")
 
-    # ② 記事生成（taku キャラ / アカウントAのみ対応。Bは今後拡張）
-    logger.info(f"② 記事生成中 (Claude / taku キャラ)...")
-    title, body_md = article_generator.generate_article_taku(topic_info)
+    # ② 記事生成（アカウントに応じてペルソナを切り替え）
+    persona = "engine (AI×自動化)" if account == "b" else "taku (大学生・お金)"
+    logger.info(f"② 記事生成中 (Claude / {persona})...")
+    title, body_md = article_generator.generate_article_for_account(topic_info, account=account)
     logger.info(f"   タイトル: {title}  ({len(body_md)}字)")
 
     # ③ .md ファイルに保存（同日ファイルがあれば連番で回避）
