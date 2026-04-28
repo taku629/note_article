@@ -31,6 +31,8 @@ from config import (
     RETRY_WAIT,
     get_headers,
     get_session,
+    get_account,
+    get_session_for,
 )
 
 # note.com のユーザー名（公開URL構築に使う）
@@ -127,19 +129,24 @@ def generate_tags(title: str, body_md: str) -> list[str]:
     return tags[:5]
 
 
-def quality_check(title: str, body_md: str, tags: list[str]) -> list[str]:
-    """投稿前の品質チェック。"""
+def quality_check(
+    title: str,
+    body_md: str,
+    tags: list[str],
+    keywords: list[str] = None,
+) -> list[str]:
+    """投稿前の品質チェック。keywords 未指定時はアカウントA向けデフォルトを使う。"""
     errors = []
     if len(body_md) < 1500:
         errors.append(f"文字数が足りません ({len(body_md)}字)。1500字以上必要です。")
-    
-    keywords = ["大学生", "副業", "バイト", "奨学金", "就活", "インターン", "資産形成", "節約", "フリーランス", "スキルアップ", "お金の勉強"]
-    if not any(kw in title for kw in keywords):
-        errors.append("タイトルに「大学生」または主要キーワードが含まれていません。")
-    
+
+    _keywords = keywords or ["大学生", "副業", "バイト", "奨学金", "就活", "インターン", "資産形成", "節約", "フリーランス", "スキルアップ", "お金の勉強"]
+    if not any(kw in title for kw in _keywords):
+        errors.append(f"タイトルに主要キーワード（{_keywords[0]} 等）が含まれていません。")
+
     if len(tags) < 5:
         errors.append(f"タグが足りません ({len(tags)}個)。5個必要です。")
-    
+
     return errors
 
 
@@ -210,7 +217,12 @@ def post_article(
     body_md: str = "",
     publish: bool = False,
     dry_run: bool = False,
+    account: str = "a",
 ) -> None:
+    acct = get_account(account)
+    urlname = acct["urlname"]
+    quality_keywords = acct["quality_keywords"]
+
     hashtags = []
     if ANTHROPIC_API_KEY:
         try:
@@ -218,27 +230,29 @@ def post_article(
         except Exception as e:
             print(f"  ⚠ タグ生成エラー: {e}")
 
-    errors = quality_check(title, body_md or body_html, hashtags)
+    errors = quality_check(title, body_md or body_html, hashtags, keywords=quality_keywords)
     if errors:
         print("  ✗ 品質チェック不合格。投稿を中止します。")
         for err in errors:
             print(f"    - {err}")
         raise ValueError(f"Quality check failed: {', '.join(errors)}")
 
-    print(f"タイトル : {title}")
+    print(f"タイトル  : {title}")
     print(f"本文文字数: {len(body_md or body_html)} 文字")
+    print(f"投稿先    : アカウント{account.upper()} ({urlname})")
     print(f"投稿モード: {'公開' if publish else '下書き保存'}")
-    print(f"タグ     : {', '.join(hashtags)}")
+    print(f"タグ      : {', '.join(hashtags)}")
 
     if dry_run:
         print("[dry-run] 実際のAPIコールはスキップします。")
         return
 
-    if not NOTE_SESSION_COOKIE:
-        print("エラー: NOTE_SESSION_COOKIE が設定されていません。", file=sys.stderr)
+    cookie = acct["session_cookie"]
+    if not cookie:
+        print(f"エラー: アカウント'{account}' の NOTE_SESSION_{account.upper()} が .env に設定されていません。", file=sys.stderr)
         sys.exit(1)
 
-    session = get_session()
+    session = get_session_for(account)
     print("  → note を作成中...", end=" ", flush=True)
     note_id, key = create_note(session, title, body_html)
     print(f"完了 (note_id={note_id}, key={key})")
@@ -247,7 +261,7 @@ def post_article(
         print("  → 本文保存 & 公開中...", end=" ", flush=True)
         draft_save(session, note_id, title, body_html, body_md or body_html, publish=True, hashtags=hashtags)
         print("完了")
-        print(f"✓ 公開完了: https://note.com/{NOTE_URLNAME}/n/{key}")
+        print(f"✓ 公開完了: https://note.com/{urlname}/n/{key}")
     else:
         print("  → 本文を下書き保存中...", end=" ", flush=True)
         draft_save(session, note_id, title, body_html, body_md or body_html, publish=False, hashtags=hashtags)
@@ -262,6 +276,7 @@ def main() -> None:
     parser.add_argument("--body", help="記事本文")
     parser.add_argument("--publish", action="store_true", help="公開する")
     parser.add_argument("--dry-run", action="store_true", help="動作確認")
+    parser.add_argument("--account", choices=["a", "b"], default="a", help="投稿先アカウント (default: a)")
 
     args = parser.parse_args()
 
@@ -275,7 +290,7 @@ def main() -> None:
         parser.print_help()
         sys.exit(1)
 
-    post_article(title, body_html, body_md, publish=args.publish, dry_run=args.dry_run)
+    post_article(title, body_html, body_md, publish=args.publish, dry_run=args.dry_run, account=args.account)
 
 
 if __name__ == "__main__":
