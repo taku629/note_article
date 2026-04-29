@@ -104,9 +104,22 @@ def parse_markdown_file(filepath: str) -> tuple[str, str, str]:
     return title, body_html, body_md
 
 
-def generate_tags(title: str, body_md: str) -> list[str]:
-    """記事タイトルと本文からnote用ハッシュタグを5個生成する（新ルール準拠）。"""
+def generate_tags(title: str, body_md: str, account: str = "a") -> list[str]:
+    """記事タイトルと本文からnote用ハッシュタグを5個生成する。アカウント別のタグ方針を使用。"""
     import anthropic
+
+    if account == "b":
+        tag_rule = (
+            "- 1個：超汎用タグ（「AI」「ChatGPT」「自動化」のどれか1つ）\n"
+            "- 2個：テーマ関連の中規模タグ（「AI活用術」「自動化ツール」「仕組み化」「LLM活用」など）\n"
+            "- 2個：記事特有のニッチタグ（使ったツール名・具体的な手法など）"
+        )
+    else:
+        tag_rule = (
+            "- 1個：超汎用タグ（「大学生」「副業」「お金」のどれか1つ）\n"
+            "- 2個：テーマ関連の中規模タグ（「大学生副業」「節約術」「就活対策」など）\n"
+            "- 2個：記事特有のニッチタグ"
+        )
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     prompt = (
@@ -115,9 +128,7 @@ def generate_tags(title: str, body_md: str) -> list[str]:
         f"本文冒頭: {body_md[:500]}\n\n"
         f"【タグ生成ルール】\n"
         f"- 合計5個\n"
-        f"- 1個：超汎用タグ（「大学生」「副業」「お金」のどれか1つ）\n"
-        f"- 2個：テーマ関連の中規模タグ（「大学生副業」「節約術」「就活対策」など）\n"
-        f"- 2個：記事特有のニッチタグ\n\n"
+        f"{tag_rule}\n\n"
         f"ハッシュタグはカンマ区切りで出力し、#は不要です。"
     )
     response = client.messages.create(
@@ -226,7 +237,7 @@ def post_article(
     hashtags = []
     if ANTHROPIC_API_KEY:
         try:
-            hashtags = generate_tags(title, body_md or body_html)
+            hashtags = generate_tags(title, body_md or body_html, account=account)
         except Exception as e:
             print(f"  ⚠ タグ生成エラー: {e}")
 
