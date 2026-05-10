@@ -35,13 +35,39 @@ PRIORITY_KEYWORDS = [
     "資産", "YouTube", "TikTok", "Instagram", "X",
 ]
 
-# フォールバック用デフォルトトピック候補
+# フォールバック用デフォルトトピック候補（大学2年・等身大方針）
 _DEFAULT_TOPICS = [
-    "大学生の節約術5選【実際にやった】",
-    "大学生がバイトと副業を両立してみた話",
-    "就活と副業を両立した大学生の1日ルーティン",
-    "大学生が投資を始めて6ヶ月で学んだこと",
-    "【実体験】SNSフォロワー1000人になるまでにやったこと",
+    # AI活用（ツール・自動化・実験）
+    "Claudeに勉強計画を立ててもらったら意外とちゃんと機能した話",
+    "AIツールを使いこなすだけで「バイト以外の選択肢」が増えた気がする話",
+    "大学生がnoteを自動投稿する仕組みを1ヶ月回してみた正直な結果",
+    "ChatGPTで大学のレポートを書いたらバレそうになった話と反省",
+    "AIにバイトのシフト管理と収支記録をやらせてみた話",
+    # お金（奨学金・生活費・失敗）
+    "大学2年生の1ヶ月の生活費を全部公開する（奨学金＋バイトのリアル）",
+    "奨学金230万を借りている大学2年が、お金の勉強を早く始めればよかったと思う3つのこと",
+    "月収3万のバイト生活から固定費を削って貯金を作るまでの記録",
+    "大学生がサブスク全部解約したら月4,000円浮いた話と見直し手順",
+    # 副業・発信（試行錯誤中）
+    "「副業に興味はあるけど何から手をつければいいかわからない」という状態のまま3ヶ月経ったレポート",
+    # キャリア準備（インターン・不安・実験）
+    "大学2年でインターンに応募してみたら面接でボコボコにされた話",
+    "ESをClaudeに5回書いてもらったら、だんだん「ぼくっぽくない文章」になってきた話",
+    "「就活、何もしてないけど大丈夫？」大学2年の正直な不安を書く",
+    "自己PRを書こうとしたら「ガクチカ」が何もなかった話",
+    "AIに自己分析させてみたら「そんなやつだったの？」という結果になった",
+    "インターン選考で落ちまくって気づいた、ぼくに足りなかったもの",
+    "就活の軸を決めようとしたら「やりたいこと」が何もなかった話",
+    "大学2年でOB訪問してみたら価値観が変わった3つのこと",
+    "AIで企業研究したらESの質が上がった気がしたので方法をまとめる",
+    "就活まで2年ある大学2年生が「今のうちにやっておいて正解だった」と思うこと",
+]
+
+# 大学2年の立場で「盛りすぎ」になりやすいNGワード
+_OVERCONFIDENT_WORDS = [
+    "内定", "年収", "達成", "フリーランス案件", "受注",
+    "大手を蹴って", "副業に全振り", "末路", "稼いだ結果",
+    "月◯万", "月○万",
 ]
 
 
@@ -89,6 +115,52 @@ def select_theme(trends: list[str]) -> str:
     return select_today_theme(trends)["topic"]
 
 
+def _get_recent_topics(days: int = 14) -> set[str]:
+    """drafts.json から直近 N 日以内に使用したトピックを返す。"""
+    import json
+    from datetime import datetime, timedelta
+    drafts_path = Path(__file__).parent / "drafts.json"
+    if not drafts_path.exists():
+        return set()
+    try:
+        drafts = json.loads(drafts_path.read_text(encoding="utf-8"))
+        cutoff = datetime.now() - timedelta(days=days)
+        recent = set()
+        for d in drafts:
+            created = d.get("created_at", "")
+            topic = d.get("picked_topic") or d.get("title", "")
+            if not created or not topic:
+                continue
+            try:
+                dt = datetime.fromisoformat(created)
+                if dt >= cutoff:
+                    # キーワードレベルで比較（「投資」が含まれるタイトルを全部まとめる）
+                    recent.add(topic)
+                    for kw in PRIORITY_KEYWORDS:
+                        if kw in topic:
+                            recent.add(kw)
+            except ValueError:
+                pass
+        return recent
+    except Exception:
+        return set()
+
+
+def _topic_is_fresh(topic: str, recent: set[str]) -> bool:
+    """トピックが直近に使われていなければ True。"""
+    if topic in recent:
+        return False
+    for kw in PRIORITY_KEYWORDS:
+        if kw in topic and kw in recent:
+            return False
+    return True
+
+
+def _topic_is_safe(topic: str) -> bool:
+    """大学2年の立場で盛りすぎにならないか確認する。NGワードを含む場合 False。"""
+    return not any(ng in topic for ng in _OVERCONFIDENT_WORDS)
+
+
 def select_today_theme(trends: list[str] | None = None) -> dict:
     """
     今日のテーマを1件選定して辞書で返す。
@@ -112,12 +184,25 @@ def select_today_theme(trends: list[str] | None = None) -> dict:
     picked_raw = ranked[0][0] if ranked else ""
     score      = ranked[0][1] if ranked else 0
 
-    # スコアが1以上のトレンドだけを候補にする。
-    # スコア0（大学生テーマと無関係）しかない場合はトレンドを無視してデフォルト候補を使う。
-    relevant = [w for w, s in ranked if s >= 1]
-    candidates = relevant[:10] if relevant else _DEFAULT_TOPICS[:5]
+    # 直近14日間に使ったキーワードを取得
+    recent_topics = _get_recent_topics(days=14)
 
-    topic   = _llm_select_topic(candidates, use_trends=bool(relevant))
+    # スコアが1以上のトレンドだけを候補にする。
+    relevant = [w for w, s in ranked if s >= 1]
+
+    if relevant:
+        # トレンドあり: 使用済み・NGワードを除外してから候補にする
+        fresh = [w for w in relevant if _topic_is_fresh(w, recent_topics) and _topic_is_safe(w)]
+        candidates = (fresh or relevant)[:10]
+        use_trends = True
+    else:
+        # トレンドなし: デフォルト候補から使用済み・NGワードを除外してローテーション
+        safe_defaults = [t for t in _DEFAULT_TOPICS if _topic_is_fresh(t, recent_topics) and _topic_is_safe(t)]
+        # 全部使い切ったらリセット（安全なものだけ再利用）
+        candidates = safe_defaults[:5] if safe_defaults else [t for t in _DEFAULT_TOPICS if _topic_is_safe(t)][:5]
+        use_trends = False
+
+    topic   = _llm_select_topic(candidates, use_trends=use_trends)
     keyword = _extract_keyword(topic)
 
     return {
@@ -153,18 +238,25 @@ def _llm_select_topic(candidates: list[str], use_trends: bool = True) -> str:
         source_note  = "トレンドは関係ないので無視し、下記の候補から最も旬な1件を選ぶこと。"
 
     prompt = (
-        "あなたは現役大学生ブロガー「taku」のテーマ選定担当です。\n\n"
+        "あなたはnoteでバズる記事タイトルを作るSNSマーケターです。\n\n"
         f"【{source_label}】\n"
         + "\n".join(f"- {t}" for t in candidates) + "\n\n"
-        "【選定ルール】\n"
+        "【書き手の前提】\n"
+        "- 都内私立大学2年生「ぼく」。一人称は平仮名「ぼく」\n"
+        "- 本選考・内定・フリーランス受注・月〇万達成などの実績はまだない\n"
+        "- 「試行錯誤の途中にいる大学生」として書く\n\n"
+        "【タイトルの鉄則】\n"
         f"1. {source_note}\n"
-        "2. テーマは「18〜22歳の大学生が実際に体験できること」に限定する。\n"
-        "   ✅ OK例: バイト、副業、就活、節約、投資入門、SNS運用、奨学金、インターン\n"
-        "   ❌ NG例: 結婚式費用、住宅ローン、育児、老後資金、不動産投資、介護、定年退職\n"
-        "3. 大学生の実体験ベースで書けるが、読んだ社会人にも「あのころ知りたかった」と\n"
-        "   思わせる普遍的な学びを含むテーマにすること。\n"
-        "4. タイトル形式は以下のどれか:\n"
-        "   「【実体験】〇〇した結果」「大学生が〇〇してみた」「〇〇選【実際にやった】」\n"
+        "2. 感情トリガーを1つ以上入れる:\n"
+        "   - 共感・不安: 「〇〇だけどこれでいいの？」「正直に話す」「〇〇が何もなかった」\n"
+        "   - 好奇心ギャップ: 「やってみたら意外と〇〇だった」「〇〇してみた結果」\n"
+        "   - 数字の具体性: 奨学金230万・月3万のバイト・3ヶ月で・5回落ちた など\n"
+        "3. テーマは「18〜24歳の大学生が実際に体験できること」に限定する\n"
+        "   ✅ インターン選考・AI活用・奨学金・バイト・就活準備・副業試行中\n"
+        "   ❌ 内定・年収・フリーランス受注・大手蹴り・副業全振り・結婚・住宅ローン\n"
+        "4. 避けるべきタイトル:\n"
+        "   ❌「〇〇のコツ5選」「〇〇の方法」「〇〇で稼いだ結果」（実績断言）\n"
+        "   ✅「〇〇してみたら〇〇だった話」「〇〇が何もなかった話」「〇〇の正直な記録」\n"
         "5. 出力はタイトルのみ1行（説明文・コメント不要）"
     )
     try:

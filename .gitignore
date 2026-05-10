@@ -3,6 +3,9 @@
 
 # 実行時データ（個人情報・状態管理）
 drafts.json
+drafts_a.json
+drafts_b.json
+records.csv
 posted.txt
 current_theme.txt
 
